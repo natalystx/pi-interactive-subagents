@@ -9,6 +9,7 @@
  *   cmux bash -c 'npm run test:integration'
  *   tmux new 'npm run test:integration'
  *   zellij --session pi  # then run: npm run test:integration
+ *   herdr                # then run in a pane: npm run test:integration
  */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -63,7 +64,9 @@ for (const backend of backends) {
       restoreBackend(prevMux);
     });
 
-    it("keeps focus on the active surface while creating and targeting subagent surfaces", async () => {
+    // herdr has no focus-by-id command, so the anchor pane cannot be focused here.
+    // Its splits pass --no-focus; the other tests still cover create/send/read/close.
+    it("keeps focus on the active surface while creating and targeting subagent surfaces", { skip: backend === "herdr" }, async () => {
       const anchor = createTrackedSurfaceSplit(env, "focus-anchor", "right");
       await sleep(1000);
 

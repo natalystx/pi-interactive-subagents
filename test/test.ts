@@ -1,4 +1,4 @@
-import { describe, it, before, after } from "node:test";
+import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
@@ -21,6 +21,9 @@ import {
   shellEscape,
   isCmuxAvailable,
   isWezTermAvailable,
+  isHerdrAvailable,
+  getMuxBackend,
+  parseHerdrPaneId,
   parseCmuxFocusedSnapshot,
   parseCmuxFocusedSnapshotFromJson,
   parseCmuxJson,
@@ -2373,6 +2376,54 @@ describe("cmux.ts", () => {
     it("returns boolean based on WEZTERM_UNIX_SOCKET", () => {
       const result = isWezTermAvailable();
       assert.equal(typeof result, "boolean");
+    });
+  });
+
+  describe("herdr", () => {
+    const HERDR_VARS = ["HERDR_ENV", "HERDR_PANE_ID", "PI_SUBAGENT_MUX"] as const;
+    let saved: Record<string, string | undefined>;
+    beforeEach(() => {
+      saved = Object.fromEntries(HERDR_VARS.map((key) => [key, process.env[key]]));
+    });
+    afterEach(() => {
+      for (const key of HERDR_VARS) {
+        if (saved[key] === undefined) delete process.env[key];
+        else process.env[key] = saved[key];
+      }
+    });
+
+    it("is unavailable without HERDR_ENV", () => {
+      delete process.env.HERDR_ENV;
+      process.env.HERDR_PANE_ID = "w1:p1";
+      assert.equal(isHerdrAvailable(), false);
+    });
+
+    it("is unavailable without a caller pane id", () => {
+      process.env.HERDR_ENV = "1";
+      delete process.env.HERDR_PANE_ID;
+      assert.equal(isHerdrAvailable(), false);
+    });
+
+    it("PI_SUBAGENT_MUX=herdr selects nothing outside herdr", () => {
+      delete process.env.HERDR_ENV;
+      process.env.PI_SUBAGENT_MUX = "herdr";
+      assert.equal(getMuxBackend(), null);
+    });
+
+    it("parses the new pane id from pane split output", () => {
+      const output = JSON.stringify({
+        id: "cli:pane:split",
+        result: { type: "pane_info", pane: { pane_id: "w1:p2", tab_id: "w1:t1" } },
+      });
+      assert.equal(parseHerdrPaneId(output, "pane split"), "w1:p2");
+    });
+
+    it("rejects output without a pane id", () => {
+      assert.throws(
+        () => parseHerdrPaneId('{"error":{"code":"pane_not_found"}}', "pane split"),
+        /Unexpected herdr pane split output/,
+      );
+      assert.throws(() => parseHerdrPaneId("not json", "pane split"), /Unexpected herdr/);
     });
   });
 });

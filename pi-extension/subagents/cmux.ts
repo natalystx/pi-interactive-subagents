@@ -6,7 +6,7 @@ import { basename, dirname, join } from "node:path";
 
 const execFileAsync = promisify(execFile);
 
-export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm";
+export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm" | "herdr";
 
 const commandAvailability = new Map<string, boolean>();
 
@@ -43,7 +43,14 @@ function hasCommand(command: string): boolean {
 
 function muxPreference(): MuxBackend | null {
   const pref = (process.env.PI_SUBAGENT_MUX ?? "").trim().toLowerCase();
-  if (pref === "cmux" || pref === "tmux" || pref === "zellij" || pref === "wezterm") return pref;
+  if (
+    pref === "cmux" ||
+    pref === "tmux" ||
+    pref === "zellij" ||
+    pref === "wezterm" ||
+    pref === "herdr"
+  )
+    return pref;
   return null;
 }
 
@@ -63,6 +70,11 @@ function isWezTermRuntimeAvailable(): boolean {
   return !!process.env.WEZTERM_UNIX_SOCKET && hasCommand("wezterm");
 }
 
+// herdr injects HERDR_ENV=1 and the caller's pane id into every pane it manages.
+function isHerdrRuntimeAvailable(): boolean {
+  return process.env.HERDR_ENV === "1" && !!process.env.HERDR_PANE_ID && hasCommand("herdr");
+}
+
 export function isCmuxAvailable(): boolean {
   return isCmuxRuntimeAvailable();
 }
@@ -79,13 +91,21 @@ export function isWezTermAvailable(): boolean {
   return isWezTermRuntimeAvailable();
 }
 
+export function isHerdrAvailable(): boolean {
+  return isHerdrRuntimeAvailable();
+}
+
 export function getMuxBackend(): MuxBackend | null {
   const pref = muxPreference();
   if (pref === "cmux") return isCmuxRuntimeAvailable() ? "cmux" : null;
   if (pref === "tmux") return isTmuxRuntimeAvailable() ? "tmux" : null;
   if (pref === "zellij") return isZellijRuntimeAvailable() ? "zellij" : null;
   if (pref === "wezterm") return isWezTermRuntimeAvailable() ? "wezterm" : null;
+  if (pref === "herdr") return isHerdrRuntimeAvailable() ? "herdr" : null;
 
+  // herdr runs inside another terminal (often cmux) and its panes can inherit
+  // that terminal's variables, so check it first: pi's own pane is a herdr pane.
+  if (isHerdrRuntimeAvailable()) return "herdr";
   if (isCmuxRuntimeAvailable()) return "cmux";
   if (isTmuxRuntimeAvailable()) return "tmux";
   if (isZellijRuntimeAvailable()) return "zellij";
@@ -111,7 +131,10 @@ export function muxSetupHint(): string {
   if (pref === "wezterm") {
     return "Start pi inside WezTerm.";
   }
-  return "Start pi inside cmux (`cmux pi`), tmux (`tmux new -A -s pi 'pi'`), zellij (`zellij --session pi`, then run `pi`), or WezTerm.";
+  if (pref === "herdr") {
+    return "Start pi inside a herdr pane (`herdr`, then run `pi`).";
+  }
+  return "Start pi inside cmux (`cmux pi`), tmux (`tmux new -A -s pi 'pi'`), zellij (`zellij --session pi`, then run `pi`), WezTerm, or a herdr pane.";
 }
 
 function requireMuxBackend(): MuxBackend {
@@ -741,6 +764,146 @@ function createCmuxSplitSurface(
   }
 }
 
+// ── herdr ──
+// Surfaces are herdr pane ids (`w1:p3`). Every herdr command answers with JSON
+// on stdout and fails with a non-zero exit, so execFileSync surfaces errors.
+
+/** Panes this pi process created for subagents, oldest first. */
+const herdrSubagentPanes: string[] = [];
+
+/** Below this height a pane is split sideways instead of down. */
+const HERDR_MIN_STACK_ROWS = 16;
+
+interface HerdrRect {
+  width: number;
+  height: number;
+}
+
+function herdrJson(args: string[]): any {
+  return JSON.parse(
+    execFileSync("herdr", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }),
+  );
+}
+
+/**
+ * A new pane's shell can drop input sent before it draws its first prompt.
+ * Wait until the pane shows any text, up to a few seconds.
+ */
+function waitForHerdrPrompt(paneId: string, timeoutMs = 5000): void {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const screen = execFileSync("herdr", ["pane", "read", paneId, "--source", "visible"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      if (screen.trim() !== "") return;
+    } catch {
+      return;
+    }
+    sleepSync(100);
+  }
+}
+
+export function parseHerdrPaneId(output: string, command: string): string {
+  let paneId: unknown;
+  try {
+    paneId = JSON.parse(output)?.result?.pane?.pane_id;
+  } catch {}
+  if (typeof paneId !== "string" || paneId === "") {
+    throw new Error(`Unexpected herdr ${command} output: ${output}`);
+  }
+  return paneId;
+}
+
+function herdrTabPaneRects(paneId: string): Map<string, HerdrRect> {
+  const rects = new Map<string, HerdrRect>();
+  try {
+    const panes = herdrJson(["pane", "layout", "--pane", paneId])?.result?.layout?.panes;
+    for (const pane of Array.isArray(panes) ? panes : []) {
+      if (typeof pane?.pane_id === "string" && pane.rect) rects.set(pane.pane_id, pane.rect);
+    }
+  } catch {}
+  return rects;
+}
+
+/** herdr splits only right or down; left and up fall back to those. */
+function splitHerdrPane(name: string, direction: "right" | "down", fromPane?: string): string {
+  const args = ["pane", "split"];
+  if (fromPane) args.push("--pane", fromPane);
+  else args.push("--current");
+  args.push("--direction", direction, "--cwd", process.cwd(), "--no-focus");
+  const paneId = parseHerdrPaneId(execFileSync("herdr", args, { encoding: "utf8" }), "pane split");
+  try {
+    execFileSync("herdr", ["pane", "rename", paneId, name], { encoding: "utf8" });
+  } catch {
+    // Optional: the label is cosmetic.
+  }
+  waitForHerdrPrompt(paneId);
+  return paneId;
+}
+
+/**
+ * First subagent splits the caller's pane to the right. Later ones split the
+ * tallest live subagent pane: down while it has room, sideways once panes get
+ * short, so no subagent ends up with an unreadable sliver.
+ */
+function createHerdrSurface(name: string): string {
+  const caller = process.env.HERDR_PANE_ID;
+  const rects = caller ? herdrTabPaneRects(caller) : new Map<string, HerdrRect>();
+  let target: string | undefined;
+  let targetRect: HerdrRect | undefined;
+  for (const paneId of herdrSubagentPanes) {
+    const rect = rects.get(paneId);
+    if (rect && (!targetRect || rect.height > targetRect.height)) {
+      target = paneId;
+      targetRect = rect;
+    }
+  }
+
+  const paneId =
+    target && targetRect
+      ? splitHerdrPane(name, targetRect.height >= HERDR_MIN_STACK_ROWS ? "down" : "right", target)
+      : splitHerdrPane(name, "right", caller);
+  herdrSubagentPanes.push(paneId);
+  return paneId;
+}
+
+const HERDR_READ_ARGS = (surface: string, lines: number) => [
+  "pane",
+  "read",
+  surface,
+  "--source",
+  "recent-unwrapped",
+  "--lines",
+  String(Math.max(1, lines)),
+];
+
+/**
+ * `recent-unwrapped` includes lines that scrolled out of a short pane and joins
+ * soft wraps, so markers survive narrow panes. It can be empty before a pane
+ * has output, so fall back to the rendered viewport.
+ */
+function readHerdrScreen(surface: string, lines: number): string {
+  const recent = execFileSync("herdr", HERDR_READ_ARGS(surface, lines), { encoding: "utf8" });
+  if (recent.trim() !== "") return tailLines(recent.replace(/\n+$/, ""), lines);
+  const visible = execFileSync("herdr", ["pane", "read", surface, "--source", "visible"], {
+    encoding: "utf8",
+  });
+  return tailLines(visible.replace(/\n+$/, ""), lines);
+}
+
+async function readHerdrScreenAsync(surface: string, lines: number): Promise<string> {
+  const recent = await execFileAsync("herdr", HERDR_READ_ARGS(surface, lines), {
+    encoding: "utf8",
+  });
+  if (recent.stdout.trim() !== "") return tailLines(recent.stdout.replace(/\n+$/, ""), lines);
+  const visible = await execFileAsync("herdr", ["pane", "read", surface, "--source", "visible"], {
+    encoding: "utf8",
+  });
+  return tailLines(visible.stdout.replace(/\n+$/, ""), lines);
+}
+
 /**
  * Create a new terminal surface for a subagent.
  *
@@ -774,6 +937,10 @@ export function createSurface(name: string): string {
 
   if (backend === "zellij") {
     return createZellijSurface(name);
+  }
+
+  if (backend === "herdr") {
+    return createHerdrSurface(name);
   }
 
   // On tmux, target the parent pi's pane so splits follow the agent, not the user's focus.
@@ -821,6 +988,11 @@ export function createSurfaceSplit(
 
   if (backend === "cmux") {
     return createCmuxSplitSurface(name, direction, fromSurface).surface;
+  }
+
+  if (backend === "herdr") {
+    const herdrDirection = direction === "left" || direction === "right" ? "right" : "down";
+    return splitHerdrPane(name, herdrDirection, fromSurface ?? process.env.HERDR_PANE_ID);
   }
 
   if (backend === "tmux") {
@@ -932,6 +1104,14 @@ export function renameCurrentTab(title: string): void {
     return;
   }
 
+  if (backend === "herdr") {
+    // Label the agent's own pane: renaming the tab would clobber the user's tab title.
+    const paneId = process.env.HERDR_PANE_ID;
+    if (!paneId) throw new Error("HERDR_PANE_ID not set");
+    execFileSync("herdr", ["pane", "rename", paneId, title], { encoding: "utf8" });
+    return;
+  }
+
   if (backend === "wezterm") {
     const paneId = process.env.WEZTERM_PANE;
     const args = ["cli", "set-tab-title"];
@@ -983,6 +1163,11 @@ export function renameWorkspace(title: string): void {
     return;
   }
 
+  if (backend === "herdr") {
+    // Skip: herdr workspaces are the user's project groupings, not per-agent state.
+    return;
+  }
+
   if (backend === "wezterm") {
     const paneId = process.env.WEZTERM_PANE;
     const args = ["cli", "set-window-title"];
@@ -1024,6 +1209,12 @@ export function sendCommand(surface: string, command: string): void {
     return;
   }
 
+  if (backend === "herdr") {
+    // `pane run` sends the text and Enter as one operation.
+    execFileSync("herdr", ["pane", "run", surface, command], { encoding: "utf8" });
+    return;
+  }
+
   if (backend === "wezterm") {
     execFileSync(
       "wezterm",
@@ -1050,6 +1241,11 @@ export function sendEscape(surface: string): void {
 
   if (backend === "tmux") {
     execFileSync("tmux", ["send-keys", "-t", surface, "Escape"], { encoding: "utf8" });
+    return;
+  }
+
+  if (backend === "herdr") {
+    execFileSync("herdr", ["pane", "send-keys", surface, "esc"], { encoding: "utf8" });
     return;
   }
 
@@ -1132,6 +1328,10 @@ export function readScreen(surface: string, lines = 50): string {
     return tailLines(raw, lines);
   }
 
+  if (backend === "herdr") {
+    return readHerdrScreen(surface, lines);
+  }
+
   // Zellij 0.44+: use --pane-id flag + stdout instead of env var + temp file.
   // The ZELLIJ_PANE_ID env var doesn't reliably target other panes for dump-screen,
   // and --path may silently fail to create the file. Stdout capture is robust.
@@ -1177,6 +1377,10 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
     return tailLines(stdout, lines);
   }
 
+  if (backend === "herdr") {
+    return readHerdrScreenAsync(surface, lines);
+  }
+
   // Zellij 0.44+: use --pane-id flag + stdout instead of env var + temp file.
   const paneId = zellijPaneId(surface);
   const { stdout } = await execFileAsync(
@@ -1202,6 +1406,11 @@ export function closeSurface(surface: string): void {
 
   if (backend === "tmux") {
     execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8" });
+    return;
+  }
+
+  if (backend === "herdr") {
+    execFileSync("herdr", ["pane", "close", surface], { encoding: "utf8" });
     return;
   }
 

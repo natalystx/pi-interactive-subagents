@@ -2,7 +2,7 @@
  * Integration test harness for pi-interactive-subagents.
  *
  * Provides utilities to:
- * - Detect available mux backends (cmux, tmux, zellij)
+ * - Detect available mux backends (cmux, tmux, zellij, herdr)
  * - Create isolated test environments with test agent definitions
  * - Start real pi sessions in mux surfaces
  * - Poll for file creation and screen output
@@ -89,7 +89,7 @@ export function getAvailableBackends(): MuxBackend[] {
   const backends: MuxBackend[] = [];
   const orig = process.env.PI_SUBAGENT_MUX;
 
-  for (const backend of ["cmux", "tmux", "zellij"] as MuxBackend[]) {
+  for (const backend of ["cmux", "tmux", "zellij", "herdr"] as MuxBackend[]) {
     process.env.PI_SUBAGENT_MUX = backend;
     try {
       if (getMuxBackend() === backend) backends.push(backend);
@@ -135,6 +135,13 @@ export function getFocusedSurface(backend: MuxBackend): string | null {
     return parseCmuxFocusedSnapshotFromJson(info)?.surfaceRef ?? null;
   }
 
+  if (backend === "herdr") {
+    const layout = JSON.parse(
+      execFileSync("herdr", ["pane", "layout", "--current"], { encoding: "utf8" }),
+    );
+    return layout?.result?.layout?.focused_pane_id ?? null;
+  }
+
   if (backend === "tmux") {
     try {
       const panes = execFileSync("tmux", ["list-panes", "-F", "#{pane_id} #{pane_active}"], {
@@ -157,6 +164,7 @@ export function getSurfacePane(backend: MuxBackend, surface: string): string | n
   }
 
   if (backend === "tmux") return surface;
+  if (backend === "herdr") return surface;
 
   throw new Error(`Pane lookup is not implemented for ${backend}`);
 }

@@ -762,6 +762,17 @@ function buildSubagentToolAllowlist(effectiveTools?: string): string | null {
   return [...allow].join(",");
 }
 
+// pi puts `@file` contents first in the initial user message, followed by the
+// first text argument. Without that text, the child sees only a file of
+// instructions, and models treat it as injected content and refuse. These
+// lines tell the child that the file is its assignment.
+const ARTIFACT_TASK_PREAMBLE =
+  "The file above is your task, written by the parent pi session that launched you as a subagent. " +
+  "It relays the user's request. Carry it out.";
+const RESUME_MESSAGE_PREAMBLE =
+  "The file above is a follow-up message from the parent pi session that launched you as a subagent. " +
+  "It relays the user's request. Act on it.";
+
 function buildPiPromptArgs(params: {
   effectiveSkills?: string;
   taskDelivery: "direct" | "artifact";
@@ -773,10 +784,10 @@ function buildPiPromptArgs(params: {
     .filter(Boolean)
     .map((skill) => `/skill:${skill}`);
 
-  const needsSeparator = params.taskDelivery === "artifact" && skillPrompts.length > 0;
-
+  // In artifact mode the preamble is the first text argument, so it joins the
+  // task file in the initial message; skill prompts follow as later messages.
   return [
-    ...(needsSeparator ? [""] : []),
+    ...(params.taskDelivery === "artifact" ? [ARTIFACT_TASK_PREAMBLE] : []),
     ...skillPrompts,
     params.taskArg,
   ];
@@ -2016,7 +2027,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           );
           mkdirSync(dirname(resumeMsgFile), { recursive: true });
           writeFileSync(resumeMsgFile, params.message, "utf8");
-          parts.push(shellEscape(`@${resumeMsgFile}`));
+          parts.push(shellEscape(RESUME_MESSAGE_PREAMBLE), shellEscape(`@${resumeMsgFile}`));
         }
 
         // Build env prefix — propagate PI_CODING_AGENT_DIR for config isolation

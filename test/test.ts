@@ -1094,18 +1094,21 @@ describe("subagent discovery", () => {
     assert.equal(testApi.buildSubagentToolAllowlist(""), null);
   });
 
-  it("buildPiPromptArgs inserts separator for artifact-backed launches with skills", () => {
-    assert.deepEqual(
-      testApi.buildPiPromptArgs({ effectiveSkills: "review,lint", taskDelivery: "artifact", taskArg: "@artifact.md" }),
-      ["", "/skill:review", "/skill:lint", "@artifact.md"],
-    );
+  it("buildPiPromptArgs frames the task file for artifact-backed launches with skills", () => {
+    const args = testApi.buildPiPromptArgs({
+      effectiveSkills: "review,lint",
+      taskDelivery: "artifact",
+      taskArg: "@artifact.md",
+    });
+    assert.match(args[0], /^The file above is your task/);
+    assert.deepEqual(args.slice(1), ["/skill:review", "/skill:lint", "@artifact.md"]);
   });
 
-  it("buildPiPromptArgs omits separator for artifact-backed launches without skills", () => {
-    assert.deepEqual(
-      testApi.buildPiPromptArgs({ effectiveSkills: undefined, taskDelivery: "artifact", taskArg: "@artifact.md" }),
-      ["@artifact.md"],
-    );
+  it("buildPiPromptArgs frames the task file for artifact-backed launches without skills", () => {
+    const args = testApi.buildPiPromptArgs({ effectiveSkills: undefined, taskDelivery: "artifact", taskArg: "@artifact.md" });
+    assert.equal(args.length, 2);
+    assert.match(args[0], /^The file above is your task/);
+    assert.equal(args[1], "@artifact.md");
   });
 
   it("buildPiPromptArgs omits separator for direct launches with skills", () => {

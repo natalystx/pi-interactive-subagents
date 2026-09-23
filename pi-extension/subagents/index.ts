@@ -84,9 +84,31 @@ function getModuleAbortSignal(): AbortSignal {
   return ((globalThis as any)[POLL_ABORT_KEY] as AbortController).signal;
 }
 
+const MAX_PARALLEL_TASKS = 8;
+
+const SubagentTaskParams = Type.Object({
+  name: Type.Optional(Type.String({ description: "Display name for this sub-agent (defaults to the agent name)" })),
+  task: Type.String({ description: "Task/prompt for this sub-agent" }),
+  agent: Type.Optional(Type.String({ description: "Agent name for this task (defaults to the top-level agent)" })),
+  model: Type.Optional(Type.String({ description: "Model override for this task" })),
+  role: Type.Optional(Type.String({ description: "pstack delegation role for this task (defaults to the top-level role)" })),
+  cwd: Type.Optional(Type.String({ description: "Working directory for this task" })),
+  skills: Type.Optional(Type.String({ description: "Comma-separated skills for this task" })),
+  tools: Type.Optional(Type.String({ description: "Comma-separated tools for this task" })),
+  systemPrompt: Type.Optional(Type.String({ description: "Appended to this task's system prompt" })),
+  autoExit: Type.Optional(Type.Boolean({ description: "Auto-exit override for this task" })),
+});
+
 const SubagentParams = Type.Object({
-  name: Type.String({ description: "Display name for the subagent" }),
-  task: Type.String({ description: "Task/prompt for the sub-agent" }),
+  name: Type.Optional(Type.String({ description: "Display name for the subagent (defaults to the agent name)" })),
+  task: Type.Optional(Type.String({ description: "Task/prompt for the sub-agent. Provide exactly one of `task` or `tasks`." })),
+  tasks: Type.Optional(
+    Type.Array(SubagentTaskParams, {
+      minItems: 1,
+      maxItems: MAX_PARALLEL_TASKS,
+      description: `Spawn up to ${MAX_PARALLEL_TASKS} sub-agents in parallel, one pane each. Top-level agent, role, model, cwd, skills, tools, systemPrompt, fork and interactive apply to every task unless the task sets its own. Tasks sharing a list role get that role's models in order. Each result is delivered separately.`,
+    }),
+  ),
   agent: Type.Optional(
     Type.String({
       description:
@@ -97,6 +119,12 @@ const SubagentParams = Type.Object({
     Type.String({ description: "Appended to system prompt (role instructions)" }),
   ),
   model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
+  role: Type.Optional(
+    Type.String({
+      description:
+        "pstack delegation role (e.g. 'swarm workers'). Picks the model from ~/.pi/agent/pstack/models.json, cycling through list roles across calls. `model` wins over `role`; `role` wins over the agent default.",
+    }),
+  ),
   skills: Type.Optional(
     Type.String({ description: "Comma-separated skills (overrides agent default)" }),
   ),
@@ -113,6 +141,12 @@ const SubagentParams = Type.Object({
     Type.Boolean({
       description:
         "Force the full-context fork mode for this spawn. The sub-agent inherits the current session conversation, overriding any agent frontmatter session-mode.",
+    }),
+  ),
+  autoExit: Type.Optional(
+    Type.Boolean({
+      description:
+        "Exit the sub-agent and report back as soon as its turn ends, without waiting for subagent_done. Defaults to the agent's `auto-exit` frontmatter, otherwise true for `role` and `tasks` calls (autonomous pstack delegation) and false for plain calls.",
     }),
   ),
   interactive: Type.Optional(
@@ -198,6 +232,33 @@ function resolveDenyTools(agentDefs: AgentDefaults | null): Set<string> {
 /** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
 function getAgentConfigDir(): string {
   return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+}
+
+const roleModelCursor = new Map<string, number>();
+
+/**
+ * Resolve a pstack role to a model from <agentDir>/pstack/models.json. List
+ * roles hand out their models round-robin across calls, or by `index` when a
+ * `tasks` call assigns them per task. "inherit-parent" and
+ * "auto" resolve to undefined so the child falls back to the next default.
+ */
+function resolveRoleModel(role: string | undefined, index?: number): string | undefined {
+  if (!role) return undefined;
+  let value: unknown;
+  try {
+    const config = JSON.parse(readFileSync(join(getAgentConfigDir(), "pstack", "models.json"), "utf8"));
+    value = config?.roles?.[role];
+  } catch {
+    return undefined;
+  }
+  const models = (typeof value === "string" ? [value] : Array.isArray(value) ? value : []).filter(
+    (model): model is string => typeof model === "string" && model !== "inherit-parent" && model !== "auto",
+  );
+  if (models.length === 0) return undefined;
+  if (index !== undefined) return models[index % models.length];
+  const cursor = roleModelCursor.get(role) ?? 0;
+  roleModelCursor.set(role, cursor + 1);
+  return models[cursor % models.length];
 }
 
 function getBundledAgentsDir(): string {
@@ -353,7 +414,21 @@ function resolveEffectiveInteractive(
 ): boolean {
   if (params.interactive != null) return params.interactive;
   if (agentDefs?.interactive != null) return agentDefs.interactive;
-  return !(agentDefs?.autoExit ?? false);
+  return !resolveEffectiveAutoExit(params, agentDefs);
+}
+
+/**
+ * Decide whether a subagent exits (and reports back) when its turn ends.
+ * An explicit `autoExit` parameter wins, then the agent's `auto-exit`
+ * frontmatter. Otherwise pstack role delegations auto-exit: they run
+ * unattended, so a child that ends its turn without calling subagent_done
+ * would otherwise never report back.
+ */
+function resolveEffectiveAutoExit(
+  params: Pick<Static<typeof SubagentParams>, "autoExit" | "role">,
+  agentDefs: AgentDefaults | null,
+): boolean {
+  return params.autoExit ?? agentDefs?.autoExit ?? Boolean(params.role);
 }
 
 function loadAgentDefaults(agentName: string): AgentDefaults | null {
@@ -491,6 +566,7 @@ interface RunningSubagent {
   name: string;
   task: string;
   agent?: string;
+  model?: string;
   surface: string;
   startTime: number;
   sessionFile: string;
@@ -898,9 +974,12 @@ export const __test__ = {
   renderSubagentWidgetLines,
   loadAgentDefaults,
   discoverAgentDefinitions,
+  resolveRoleModel,
+  expandSubagentCall,
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
+  resolveEffectiveAutoExit,
   buildSubagentToolAllowlist,
   buildPiPromptArgs,
   formatWidgetRightLabel,
@@ -930,8 +1009,54 @@ function startWidgetRefresh() {
  *
  * Call watchSubagent() on the returned object to observe completion.
  */
+type SubagentLaunchParams = Omit<Static<typeof SubagentParams>, "tasks"> & {
+  name: string;
+  task: string;
+  roleIndex?: number;
+};
+
+/**
+ * Expand a subagent call into one launch per sub-agent. `tasks` entries
+ * inherit the top-level fields they leave unset, and each list role's models
+ * are dealt out in order across the tasks that share it.
+ */
+function expandSubagentCall(params: Static<typeof SubagentParams>): SubagentLaunchParams[] | { error: string } {
+  const { tasks, ...shared } = params;
+  if (tasks?.length && params.task) return { error: "Provide exactly one of `task` or `tasks`, not both." };
+  if (!tasks?.length) {
+    if (!params.task) return { error: "Provide `task` (single sub-agent) or `tasks` (parallel sub-agents)." };
+    return [{ ...shared, name: params.name || params.agent || "Subagent", task: params.task }];
+  }
+  if (tasks.length > MAX_PARALLEL_TASKS) return { error: `At most ${MAX_PARALLEL_TASKS} parallel tasks are allowed.` };
+
+  const roleCounts = new Map<string, number>();
+  const baseNames = tasks.map((task) => task.name || task.agent || shared.agent || shared.name || "Subagent");
+  const nameTotals = new Map<string, number>();
+  for (const name of baseNames) nameTotals.set(name, (nameTotals.get(name) ?? 0) + 1);
+  const nameSeen = new Map<string, number>();
+
+  return tasks.map((task, index) => {
+    const role = task.role ?? shared.role;
+    const roleIndex = role ? (roleCounts.get(role) ?? 0) : undefined;
+    if (role) roleCounts.set(role, (roleIndex ?? 0) + 1);
+    const baseName = baseNames[index];
+    const seen = (nameSeen.get(baseName) ?? 0) + 1;
+    nameSeen.set(baseName, seen);
+    const overrides = Object.fromEntries(Object.entries(task).filter(([, value]) => value !== undefined));
+    return {
+      ...shared,
+      ...overrides,
+      role,
+      roleIndex,
+      autoExit: task.autoExit ?? shared.autoExit ?? true,
+      name: nameTotals.get(baseName)! > 1 ? `${baseName} ${seen}` : baseName,
+      task: task.task,
+    };
+  });
+}
+
 async function launchSubagent(
-  params: typeof SubagentParams.static,
+  params: SubagentLaunchParams,
   ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
   options?: { surface?: string },
 ): Promise<RunningSubagent> {
@@ -939,11 +1064,13 @@ async function launchSubagent(
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-  const effectiveModel = params.model ?? agentDefs?.model;
+  const roleModel = params.model ? undefined : resolveRoleModel(params.role, params.roleIndex);
+  const effectiveModel = params.model ?? roleModel ?? agentDefs?.model;
   const effectiveTools = params.tools ?? agentDefs?.tools;
   const effectiveSkills = params.skills ?? agentDefs?.skills;
-  const effectiveThinking = agentDefs?.thinking;
+  const effectiveThinking = roleModel ? undefined : agentDefs?.thinking;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
+  const effectiveAutoExit = resolveEffectiveAutoExit(params, agentDefs);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
   if (!sessionFile) throw new Error("No session file");
@@ -992,10 +1119,10 @@ async function launchSubagent(
   // Build the task message
   // Only full-context fork mode inherits prior conversation state.
   // Blank-session modes need the wrapper instructions and artifact-backed handoff.
-  const modeHint = agentDefs?.autoExit
+  const modeHint = effectiveAutoExit
     ? "Complete your task autonomously."
     : "Complete your task. When finished, call the subagent_done tool. The user can interact with you at any time.";
-  const summaryInstruction = agentDefs?.autoExit
+  const summaryInstruction = effectiveAutoExit
     ? "Your FINAL assistant message should summarize what you accomplished."
     : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
   const denySet = resolveDenyTools(agentDefs);
@@ -1060,6 +1187,7 @@ async function launchSubagent(
     const running: RunningSubagent = {
       id,
       name: params.name,
+      model: effectiveModel,
       task: params.task,
       agent: params.agent,
       surface,
@@ -1136,7 +1264,7 @@ async function launchSubagent(
   if (params.agent) {
     envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
   }
-  if (agentDefs?.autoExit) {
+  if (effectiveAutoExit) {
     envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
   }
   envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
@@ -1201,6 +1329,7 @@ async function launchSubagent(
   const running: RunningSubagent = {
     id,
     name: params.name,
+    model: effectiveModel,
     task: params.task,
     agent: params.agent,
     surface,
@@ -1406,20 +1535,30 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
-        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
+        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready. " +
+        `To spawn several sub-agents at once, pass \`tasks\` (up to ${MAX_PARALLEL_TASKS}) instead of \`task\`; each task gets its own pane and its own result message.`,
       promptSnippet:
         "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
-        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
+        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready. " +
+        `To spawn several sub-agents at once, pass \`tasks\` (up to ${MAX_PARALLEL_TASKS}) instead of \`task\`; each task gets its own pane and its own result message.`,
       parameters: SubagentParams,
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        const launches = expandSubagentCall(params);
+        if ("error" in launches) {
+          return {
+            content: [{ type: "text", text: `Error: ${launches.error}` }],
+            details: { error: launches.error },
+          };
+        }
+
         // Prevent self-spawning (e.g. planner spawning another planner)
         const currentAgent = process.env.PI_SUBAGENT_AGENT;
-        if (params.agent && currentAgent && params.agent === currentAgent) {
+        if (currentAgent && launches.some((launch) => launch.agent === currentAgent)) {
           return {
             content: [
               {
@@ -1448,96 +1587,129 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        // Launch the subagent (creates pane, sends command)
-        const running = await launchSubagent(params, ctx);
+        // Launch each subagent (creates pane, sends command), then watch it
+        const launched: RunningSubagent[] = [];
+        for (const launch of launches) {
+          const running = await launchSubagent(launch, ctx);
+          launched.push(running);
 
-        // Create a separate AbortController for the watcher
-        // (the tool's signal completes when we return)
-        const watcherAbort = new AbortController();
-        running.abortController = watcherAbort;
+          // Create a separate AbortController for the watcher
+          // (the tool's signal completes when we return)
+          const watcherAbort = new AbortController();
+          running.abortController = watcherAbort;
 
-        // Start widget refresh and status supervision when the first agent launches
-        startWidgetRefresh();
-        startStatusRefresh(pi);
+          // Start widget refresh and status supervision when the first agent launches
+          startWidgetRefresh();
+          startStatusRefresh(pi);
 
-        // Fire-and-forget: start watching in background
-        watchSubagent(running, watcherAbort.signal)
-          .then((result) => {
-            updateWidget(); // reflect removal from Map immediately
+          // Fire-and-forget: start watching in background
+          watchSubagent(running, watcherAbort.signal)
+            .then((result) => {
+              updateWidget(); // reflect removal from Map immediately
 
-            if (result.ping) {
-              // Subagent is requesting help — steer a ping message with session path for resume
-              const sessionRef = `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`;
+              if (result.ping) {
+                // Subagent is requesting help — steer a ping message with session path for resume
+                const sessionRef = `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`;
+                pi.sendMessage(
+                  {
+                    customType: "subagent_ping",
+                    content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${sessionRef}`,
+                    display: true,
+                    details: {
+                      name: result.ping.name,
+                      message: result.ping.message,
+                      agent: running.agent,
+                      sessionFile: result.sessionFile,
+                    },
+                  },
+                  { triggerTurn: true, deliverAs: "steer" },
+                );
+                return;
+              }
+
+              const presentation = resolveResultPresentation(result, running.name);
+
               pi.sendMessage(
                 {
-                  customType: "subagent_ping",
-                  content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${sessionRef}`,
+                  customType: "subagent_result",
+                  content: presentation,
                   display: true,
                   details: {
-                    name: result.ping.name,
-                    message: result.ping.message,
+                    name: running.name,
+                    task: running.task,
                     agent: running.agent,
+                    exitCode: result.exitCode,
+                    elapsed: result.elapsed,
                     sessionFile: result.sessionFile,
+                    ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+                    ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
                   },
                 },
                 { triggerTurn: true, deliverAs: "steer" },
               );
-              return;
-            }
-
-            const presentation = resolveResultPresentation(result, running.name);
-
-            pi.sendMessage(
-              {
-                customType: "subagent_result",
-                content: presentation,
-                display: true,
-                details: {
-                  name: running.name,
-                  task: running.task,
-                  agent: running.agent,
-                  exitCode: result.exitCode,
-                  elapsed: result.elapsed,
-                  sessionFile: result.sessionFile,
-                  ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-                  ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
+            })
+            .catch((err) => {
+              updateWidget();
+              pi.sendMessage(
+                {
+                  customType: "subagent_result",
+                  content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
+                  display: true,
+                  details: { name: running.name, task: running.task, error: err?.message },
                 },
-              },
-              { triggerTurn: true, deliverAs: "steer" },
-            );
-          })
-          .catch((err) => {
-            updateWidget();
-            pi.sendMessage(
-              {
-                customType: "subagent_result",
-                content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
-                display: true,
-                details: { name: running.name, task: running.task, error: err?.message },
-              },
-              { triggerTurn: true, deliverAs: "steer" },
-            );
-          });
+                { triggerTurn: true, deliverAs: "steer" },
+              );
+            });
+        }
 
         // Return immediately
+        if (launched.length === 1) {
+          const [running] = launched;
+          const [launch] = launches;
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `Sub-agent "${launch.name}" launched and is now running in the background. ` +
+                  `Do NOT generate or assume any results — you have no idea what the sub-agent will do or produce. ` +
+                  `The results will be delivered to you automatically as a steer message when the sub-agent finishes. ` +
+                  `Until then, move on to other work or tell the user you're waiting.`,
+              },
+            ],
+            details: {
+              id: running.id,
+              name: launch.name,
+              task: launch.task,
+              agent: launch.agent,
+              sessionFile: running.sessionFile,
+              launchScriptFile: running.launchScriptFile,
+              status: "started",
+            },
+          };
+        }
+
+        const roster = launched.map((running, i) => `- "${launches[i].name}"${running.model ? ` on ${running.model}` : ""}`).join("\n");
         return {
           content: [
             {
               type: "text",
               text:
-                `Sub-agent "${params.name}" launched and is now running in the background. ` +
-                `Do NOT generate or assume any results — you have no idea what the sub-agent will do or produce. ` +
-                `The results will be delivered to you automatically as a steer message when the sub-agent finishes. ` +
-                `Until then, move on to other work or tell the user you're waiting.`,
+                `${launched.length} sub-agents launched and are now running in the background:\n${roster}\n\n` +
+                `Do NOT generate or assume any results — you have no idea what the sub-agents will do or produce. ` +
+                `Each result will be delivered to you automatically as a separate steer message when that sub-agent finishes. ` +
+                `Wait for all ${launched.length} before combining them. Until then, move on to other work or tell the user you're waiting.`,
             },
           ],
           details: {
-            id: running.id,
-            name: params.name,
-            task: params.task,
-            agent: params.agent,
-            sessionFile: running.sessionFile,
-            launchScriptFile: running.launchScriptFile,
+            name: `${launched.length} sub-agents`,
+            subagents: launched.map((running, i) => ({
+              id: running.id,
+              name: launches[i].name,
+              agent: launches[i].agent,
+              model: running.model,
+              sessionFile: running.sessionFile,
+            })),
             status: "started",
           },
         };
@@ -1545,7 +1717,26 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       renderCall(args, theme) {
         const partialArgs = args as Record<string, unknown>;
-        const name = typeof partialArgs.name === "string" && partialArgs.name ? partialArgs.name : "(unnamed)";
+        if (Array.isArray(partialArgs.tasks) && partialArgs.tasks.length > 0) {
+          const tasks = partialArgs.tasks as Array<Record<string, unknown>>;
+          const lines = tasks.map((task) => {
+            const label = [task.name, task.agent, partialArgs.agent].find((v) => typeof v === "string" && v) ?? "Subagent";
+            const role = task.role ?? partialArgs.role;
+            const preview = typeof task.task === "string" ? (task.task.split("\n").find((l) => l.trim()) ?? "") : "";
+            return (
+              "  • " +
+              theme.fg("toolTitle", String(label)) +
+              (typeof role === "string" && role ? theme.fg("dim", ` [${role}]`) : "") +
+              (preview ? " " + theme.fg("toolOutput", preview.length > 80 ? preview.slice(0, 80) + "…" : preview) : "")
+            );
+          });
+          return new Text(
+            "▸ " + theme.fg("toolTitle", theme.bold(`${tasks.length} sub-agents`)) + "\n" + lines.join("\n"),
+            0,
+            0,
+          );
+        }
+        const name = typeof partialArgs.name === "string" && partialArgs.name ? partialArgs.name : typeof partialArgs.agent === "string" && partialArgs.agent ? partialArgs.agent : "(unnamed)";
         const task = typeof partialArgs.task === "string" ? partialArgs.task : "";
         const agent = typeof partialArgs.agent === "string" && partialArgs.agent
           ? theme.fg("dim", ` (${partialArgs.agent})`)

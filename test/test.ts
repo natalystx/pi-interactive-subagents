@@ -1219,6 +1219,111 @@ describe("subagent discovery", () => {
     });
   });
 });
+describe("pstack role models", () => {
+  it("resolves role models from pstack/models.json, cycling list roles", async () => {
+    await withIsolatedAgentEnv(({ globalDir }) => {
+      const testApi = (subagentsModule as any).__test__;
+      mkdirSync(join(globalDir, "pstack"), { recursive: true });
+      writeFileSync(
+        join(globalDir, "pstack", "models.json"),
+        JSON.stringify({
+          version: 1,
+          roles: {
+            "bug-fix": "claude-bridge/claude-fable-5-1:medium",
+            "arena runners": ["a/one:high", "inherit-parent", "b/two:max"],
+            hillclimb: "inherit-parent",
+          },
+        }),
+      );
+
+      assert.equal(testApi.resolveRoleModel("bug-fix"), "claude-bridge/claude-fable-5-1:medium");
+      assert.equal(testApi.resolveRoleModel("arena runners"), "a/one:high");
+      assert.equal(testApi.resolveRoleModel("arena runners"), "b/two:max");
+      assert.equal(testApi.resolveRoleModel("arena runners"), "a/one:high");
+      assert.equal(testApi.resolveRoleModel("hillclimb"), undefined);
+      assert.equal(testApi.resolveRoleModel("unknown"), undefined);
+      assert.equal(testApi.resolveRoleModel(undefined), undefined);
+    });
+  });
+
+  it("resolves list roles by explicit index", async () => {
+    await withIsolatedAgentEnv(({ globalDir }) => {
+      const testApi = (subagentsModule as any).__test__;
+      mkdirSync(join(globalDir, "pstack"), { recursive: true });
+      writeFileSync(
+        join(globalDir, "pstack", "models.json"),
+        JSON.stringify({ version: 1, roles: { "architect runners": ["a/one", "b/two", "c/three"] } }),
+      );
+      assert.equal(testApi.resolveRoleModel("architect runners", 0), "a/one");
+      assert.equal(testApi.resolveRoleModel("architect runners", 2), "c/three");
+      assert.equal(testApi.resolveRoleModel("architect runners", 4), "b/two");
+    });
+  });
+
+  it("expands tasks with inherited fields, per-role indexes, and unique names", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const launches = testApi.expandSubagentCall({
+      agent: "poteto-agent",
+      role: "architect runners",
+      cwd: "/repo",
+      tasks: [
+        { task: "one" },
+        { task: "two" },
+        { task: "three", role: "reflect tooling", name: "Tooling" },
+        { task: "four", agent: "scout", model: "x/y" },
+      ],
+    });
+
+    assert.deepEqual(
+      launches.map((l: any) => [l.name, l.agent, l.role, l.roleIndex, l.cwd, l.model, l.task]),
+      [
+        ["poteto-agent 1", "poteto-agent", "architect runners", 0, "/repo", undefined, "one"],
+        ["poteto-agent 2", "poteto-agent", "architect runners", 1, "/repo", undefined, "two"],
+        ["Tooling", "poteto-agent", "reflect tooling", 0, "/repo", undefined, "three"],
+        ["scout", "scout", "architect runners", 2, "/repo", "x/y", "four"],
+      ],
+    );
+    assert.equal(launches.some((l: any) => "tasks" in l), false);
+  });
+
+  it("expands a single task and rejects ambiguous calls", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const [single] = testApi.expandSubagentCall({ agent: "scout", task: "look", role: "bug-fix" });
+    assert.equal(single.name, "scout");
+    assert.equal(single.roleIndex, undefined);
+
+    assert.match(testApi.expandSubagentCall({ name: "x" }).error, /Provide `task`/);
+    assert.match(testApi.expandSubagentCall({ task: "a", tasks: [{ task: "b" }] }).error, /exactly one/);
+  });
+
+  it("auto-exits role and tasks delegations unless told otherwise", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const resolve = testApi.resolveEffectiveAutoExit;
+    assert.equal(resolve({}, null), false);
+    assert.equal(resolve({ role: "bug-fix" }, null), true);
+    assert.equal(resolve({ role: "bug-fix" }, { autoExit: false }), false);
+    assert.equal(resolve({ role: "bug-fix", autoExit: false }, { autoExit: true }), false);
+    assert.equal(resolve({ autoExit: true }, null), true);
+    assert.equal(resolve({}, { autoExit: true }), true);
+
+    assert.equal(testApi.resolveEffectiveInteractive({ name: "A", task: "T", role: "bug-fix" }, null), false);
+
+    const launches = testApi.expandSubagentCall({
+      agent: "poteto-agent",
+      tasks: [{ task: "a" }, { task: "b", autoExit: false }],
+    });
+    assert.deepEqual(launches.map((l: any) => l.autoExit), [true, false]);
+    assert.equal(testApi.expandSubagentCall({ task: "solo" })[0].autoExit, undefined);
+  });
+
+  it("returns undefined when pstack/models.json is missing", async () => {
+    await withIsolatedAgentEnv(() => {
+      const testApi = (subagentsModule as any).__test__;
+      assert.equal(testApi.resolveRoleModel("bug-fix"), undefined);
+    });
+  });
+});
+
 describe("subagent-done.ts", () => {
   describe("shouldMarkUserTookOver", () => {
     it("ignores the initial injected task before the first agent run", () => {
@@ -1294,6 +1399,26 @@ describe("subagent-done.ts", () => {
       assert.equal(findLatestAssistantError(undefined), null);
       assert.equal(findLatestAssistantError([]), null);
     });
+  });
+});
+
+describe("cmux.ts pollForExit", () => {
+  it("treats a pane that can no longer be read as finished", async () => {
+    const env = ["CMUX_SOCKET_PATH", "TMUX", "ZELLIJ", "WEZTERM_PANE", "HERDR_ENV", "PI_SUBAGENT_MUX"];
+    const saved = env.map((name) => [name, process.env[name]] as const);
+    for (const name of env) delete process.env[name];
+    try {
+      const { pollForExit } = await import("../pi-extension/subagents/cmux.ts");
+      const ticks: number[] = [];
+      const result = await pollForExit("gone-pane", new AbortController().signal, {
+        interval: 5,
+        onTick: (elapsed) => ticks.push(elapsed),
+      });
+      assert.deepEqual(result, { reason: "surface-closed", exitCode: 0 });
+      assert.equal(ticks.length, 2);
+    } finally {
+      for (const [name, value] of saved) restoreEnvVar(name, value);
+    }
   });
 });
 

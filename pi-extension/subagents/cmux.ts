@@ -1426,7 +1426,7 @@ export function closeSurface(surface: string): void {
 
 export interface PollResult {
   /** How the subagent exited */
-  reason: "done" | "ping" | "sentinel" | "error";
+  reason: "done" | "ping" | "sentinel" | "error" | "surface-closed";
   /** Shell exit code (from sentinel). 0 for file-based exits. */
   exitCode: number;
   /** Ping data if reason is "ping" */
@@ -1465,6 +1465,8 @@ export const __pollForExitTest__ = { interpretExitSidecar };
  * (written by subagent_done / caller_ping), falling back to the terminal
  * sentinel for crash detection.
  */
+const SURFACE_CLOSED_AFTER_FAILED_READS = 3;
+
 export async function pollForExit(
   surface: string,
   signal: AbortSignal,
@@ -1476,6 +1478,7 @@ export async function pollForExit(
   },
 ): Promise<PollResult> {
   const start = Date.now();
+  let failedReads = 0;
 
   for (;;) {
     if (signal.aborted) {
@@ -1506,6 +1509,7 @@ export async function pollForExit(
     // Slow path: read terminal screen for sentinel (crash detection)
     try {
       const screen = await readScreenAsync(surface, 5);
+      failedReads = 0;
       const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
       if (match) {
         return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
@@ -1521,6 +1525,15 @@ export async function pollForExit(
             return interpretExitSidecar(data);
           }
         } catch {}
+      }
+      // The pane is gone, so the child can no longer print the sentinel and
+      // nothing else will end this loop. A clean auto-exit writes no .exit
+      // sidecar, and a multiplexer may close the pane as soon as pi exits.
+      // Treat a pane that stays unreadable as finished; the caller reads the
+      // result from the session file.
+      failedReads += 1;
+      if (failedReads >= SURFACE_CLOSED_AFTER_FAILED_READS) {
+        return { reason: "surface-closed", exitCode: 0 };
       }
     }
 

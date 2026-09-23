@@ -56,6 +56,7 @@ import {
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
+  latestAssistantHasText,
 } from "../pi-extension/subagents/subagent-done.ts";
 import { __pollForExitTest__ } from "../pi-extension/subagents/cmux.ts";
 
@@ -1328,6 +1329,29 @@ describe("pstack role models", () => {
 });
 
 describe("subagent-done.ts", () => {
+  describe("latestAssistantHasText", () => {
+    const assistant = (...content: any[]) => ({ type: "message", message: { role: "assistant", content } });
+    const user = (text: string) => ({ type: "message", message: { role: "user", content: [{ type: "text", text }] } });
+    const call = { type: "toolCall", name: "subagent_done", arguments: {} };
+
+    it("is false when the latest assistant message is only a tool call", () => {
+      assert.equal(latestAssistantHasText([user("task"), assistant({ type: "thinking", thinking: "done" }, call)]), false);
+    });
+
+    it("ignores text in earlier assistant messages", () => {
+      assert.equal(latestAssistantHasText([assistant({ type: "text", text: "A-OK" }), user("more"), assistant(call)]), false);
+    });
+
+    it("is true when the latest assistant message has text next to the call", () => {
+      assert.equal(latestAssistantHasText([user("task"), assistant({ type: "text", text: "A-OK" }, call)]), true);
+    });
+
+    it("treats whitespace-only text as empty and skips non-message entries", () => {
+      assert.equal(latestAssistantHasText([assistant({ type: "text", text: "  " }), { type: "custom" }]), false);
+      assert.equal(latestAssistantHasText([]), false);
+    });
+  });
+
   describe("shouldMarkUserTookOver", () => {
     it("ignores the initial injected task before the first agent run", () => {
       assert.equal(shouldMarkUserTookOver(false), false);

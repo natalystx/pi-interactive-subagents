@@ -13,6 +13,23 @@ export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
 }
 
+/**
+ * True when the newest assistant message in the branch has non-empty text.
+ * subagent_done runs after its own calling message is saved, so this checks
+ * whether the child wrote a reply alongside the call. The parent only receives
+ * assistant text, so closing without any leaves it an empty result.
+ */
+export function latestAssistantHasText(entries: readonly any[]): boolean {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const message = entries[i]?.type === "message" ? entries[i].message : undefined;
+    if (message?.role !== "assistant") continue;
+    return (Array.isArray(message.content) ? message.content : []).some(
+      (block: any) => block?.type === "text" && typeof block.text === "string" && block.text.trim() !== "",
+    );
+  }
+  return false;
+}
+
 export function shouldAutoExitOnAgentEnd(
   _userTookOver: boolean,
   messages: any[] | undefined,
@@ -85,6 +102,7 @@ export default function (pi: ExtensionAPI) {
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
+  let doneNudged = false;
   const recorder = createSubagentActivityRecorder({
     runningChildId: process.env.PI_SUBAGENT_ID,
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
@@ -309,6 +327,22 @@ export default function (pi: ExtensionAPI) {
       "Your LAST assistant message before calling this becomes the summary returned to the caller.",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      // A child that calls this before writing any reply would hand the parent
+      // an empty result. Ask once for the reply; a second call always closes.
+      if (!doneNudged && !latestAssistantHasText(ctx.sessionManager.getBranch())) {
+        doneNudged = true;
+        return {
+          content: [
+            {
+              type: "text",
+              text: autoExit
+                ? "Not closed: your last message had no text, so the parent would get an empty result. Write your final reply as a normal message now and end your turn. This session closes by itself after that reply."
+                : "Not closed: your last message had no text, so the parent would get an empty result. Write your final reply as a normal message, then call subagent_done again.",
+            },
+          ],
+          details: {},
+        };
+      }
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       recorder.subagentDone();
       if (sessionFile) {

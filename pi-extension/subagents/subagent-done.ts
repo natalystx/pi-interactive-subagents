@@ -30,6 +30,12 @@ export function latestAssistantHasText(entries: readonly any[]): boolean {
   return false;
 }
 
+/** Sub-agents this process launched that have not finished (see index.ts). */
+function hasRunningSubagents(): boolean {
+  const running = (globalThis as any)[Symbol.for("pi-subagents/running")] as Map<string, unknown> | undefined;
+  return (running?.size ?? 0) > 0;
+}
+
 export function shouldAutoExitOnAgentEnd(
   _userTookOver: boolean,
   messages: any[] | undefined,
@@ -191,7 +197,9 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_end", (event, ctx) => {
     const messages = (event as any).messages as any[] | undefined;
-    const shouldExit = autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
+    // Exiting would cancel this subagent's own sub-agents. Their results
+    // trigger another turn, and the auto-exit check runs again at its end.
+    const shouldExit = autoExit && !hasRunningSubagents() && shouldAutoExitOnAgentEnd(userTookOver, messages);
 
     if (shouldExit) {
       // Surface stopReason: "error" turns (auto-retry exhausted, provider

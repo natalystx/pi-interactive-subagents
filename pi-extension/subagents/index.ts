@@ -599,8 +599,13 @@ interface RunningSubagent {
   interactive: boolean;
 }
 
-/** All currently running subagents, keyed by id. */
+/**
+ * All currently running subagents, keyed by id. Published on globalThis so
+ * subagent-done.ts can keep an auto-exit subagent alive while its own
+ * sub-agents still run.
+ */
 const runningSubagents = new Map<string, RunningSubagent>();
+(globalThis as any)[Symbol.for("pi-subagents/running")] = runningSubagents;
 
 // ── Widget management ──
 

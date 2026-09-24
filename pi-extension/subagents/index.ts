@@ -75,8 +75,16 @@ const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
     clearInterval(prevStatusInterval);
     (globalThis as any)[STATUS_INTERVAL_KEY] = null;
   }
-  const prevAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
-  if (prevAbort) prevAbort.abort();
+  renewModuleAbortSignal();
+}
+
+/**
+ * Abort every poll loop started so far and hand later ones a live signal.
+ * Session switches (/new, /resume, /fork) shut the session down without
+ * re-importing this module, so the replacement must happen here too.
+ */
+function renewModuleAbortSignal(): void {
+  ((globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined)?.abort();
   (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
 }
 
@@ -1517,8 +1525,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       statusInterval = null;
       (globalThis as any)[STATUS_INTERVAL_KEY] = null;
     }
-    const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
-    if (moduleAbort) moduleAbort.abort();
+    renewModuleAbortSignal();
     for (const [_id, agent] of runningSubagents) {
       agent.abortController?.abort();
     }

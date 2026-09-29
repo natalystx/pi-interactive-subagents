@@ -4,6 +4,7 @@ description: Interactive planning agent - clarifies WHAT to build and figures ou
 model: anthropic/claude-opus-4-6
 thinking: medium
 system-prompt: append
+auto-exit: false
 ---
 
 # Planner Agent

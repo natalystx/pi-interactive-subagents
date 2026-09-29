@@ -406,11 +406,11 @@ function resolveLaunchBehavior(
  * Resolution order:
  *   1. Explicit `interactive` tool parameter wins.
  *   2. Explicit `interactive` frontmatter field on the agent.
- *   3. Default: the inverse of `auto-exit`. Agents that auto-exit are
- *      autonomous (scout, worker, reviewer) and the parent session should be
- *      woken on stall/recovery transitions. Agents that don't auto-exit are
- *      driven by the user in their own pane (planner, iterate/fork) and
- *      stall pings are noise.
+ *   3. Default: the inverse of the effective auto-exit. Agents that
+ *      auto-exit are autonomous (scout, worker, reviewer) and the parent
+ *      session should be woken on stall/recovery transitions. Agents that
+ *      don't auto-exit are driven by the user in their own pane (planner,
+ *      iterate/fork) and stall pings are noise.
  *
  * When no agent defs exist at all (bare `subagent({ name, task })` call,
  * typical for `/iterate` with `fork: true`), `autoExit` is undefined and the
@@ -428,15 +428,17 @@ function resolveEffectiveInteractive(
 /**
  * Decide whether a subagent exits (and reports back) when its turn ends.
  * An explicit `autoExit` parameter wins, then the agent's `auto-exit`
- * frontmatter. Otherwise pstack role delegations auto-exit: they run
- * unattended, so a child that ends its turn without calling subagent_done
- * would otherwise never report back.
+ * frontmatter. Otherwise named agents and pstack role delegations auto-exit:
+ * they run unattended, so a child that ends its turn without calling
+ * subagent_done would sit open and never report back. Interactive agents
+ * opt out with `auto-exit: false`. Bare spawns (no agent defs, e.g.
+ * `/iterate` forks) stay open for the user.
  */
 function resolveEffectiveAutoExit(
   params: Pick<Static<typeof SubagentParams>, "autoExit" | "role">,
   agentDefs: AgentDefaults | null,
 ): boolean {
-  return params.autoExit ?? agentDefs?.autoExit ?? Boolean(params.role);
+  return params.autoExit ?? agentDefs?.autoExit ?? (agentDefs != null || Boolean(params.role));
 }
 
 function loadAgentDefaults(agentName: string): AgentDefaults | null {

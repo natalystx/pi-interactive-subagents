@@ -944,9 +944,10 @@ describe("subagent discovery", () => {
       testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, { autoExit: false }),
       true,
     );
+    // A named agent without auto-exit frontmatter auto-exits, so it is autonomous.
     assert.equal(
       testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, {}),
-      true,
+      false,
     );
     // Bare spawn with no agent defs (e.g. /iterate fork) is interactive by default.
     assert.equal(
@@ -1007,7 +1008,7 @@ describe("subagent discovery", () => {
     assert.equal(
       testApi.resolveEffectiveInteractive({ name: "planner", task: "" }, planner),
       true,
-      "planner should resolve as interactive (no auto-exit)",
+      "planner should resolve as interactive (auto-exit: false)",
     );
   });
 
@@ -1309,6 +1310,9 @@ describe("pstack role models", () => {
     assert.equal(resolve({ role: "bug-fix", autoExit: false }, { autoExit: true }), false);
     assert.equal(resolve({ autoExit: true }, null), true);
     assert.equal(resolve({}, { autoExit: true }), true);
+    // Named agents without auto-exit frontmatter auto-exit; bare spawns stay open.
+    assert.equal(resolve({}, {}), true);
+    assert.equal(resolve({}, { autoExit: false }), false);
 
     assert.equal(testApi.resolveEffectiveInteractive({ name: "A", task: "T", role: "bug-fix" }, null), false);
 
